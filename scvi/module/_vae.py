@@ -1,14 +1,15 @@
 """Main module."""
-from typing import Callable, Iterable, Literal, Optional
+from typing import Callable, Iterable, Literal, Optional, Sequence
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import logsumexp
-from torch.distributions import Normal
+from torch.distributions import Normal, Categorical
 from torch.distributions import kl_divergence as kl
-
+from ._utils import broadcast_labels
 from scvi import REGISTRY_KEYS
+from ._classifier import Classifier
 from scvi.autotune._types import Tunable
 from scvi.data._constants import ADATA_MINIFY_TYPE
 from scvi.distributions import NegativeBinomial, Poisson, ZeroInflatedNegativeBinomial
@@ -45,7 +46,6 @@ class VAE(BaseMinifiedModeModuleClass):
         Dropout rate for neural networks
     dispersion
         One of the following
-
         * ``'gene'`` - dispersion parameter of NB is constant per gene across cells
         * ``'gene-batch'`` - dispersion can differ between different batches
         * ``'gene-label'`` - dispersion can differ between different labels
@@ -63,6 +63,12 @@ class VAE(BaseMinifiedModeModuleClass):
 
         * ``'normal'`` - Isotropic normal
         * ``'ln'`` - Logistic normal with normal params N(0, 1)
+    
+    labels_groups
+        Label group designations
+    use_labels_groups
+        Whether to use the label groups
+   
     encode_covariates
         Whether to concatenate covariates to expression in encoder
     deeply_inject_covariates
@@ -80,6 +86,8 @@ class VAE(BaseMinifiedModeModuleClass):
     library_log_means
         1 x n_batch array of means of the log library sizes. Parameterizes prior on library size if
         not using observed library size.
+    y_prior
+        If None, initialized to uniform probability over cell types
     library_log_vars
         1 x n_batch array of variances of the log library sizes. Parameterizes prior on library size if
         not using observed library size.
@@ -105,6 +113,10 @@ class VAE(BaseMinifiedModeModuleClass):
         log_variational: bool = True,
         gene_likelihood: Tunable[Literal["zinb", "nb", "poisson"]] = "zinb",
         latent_distribution: Tunable[Literal["normal", "ln"]] = "normal",
+        labels_groups: Sequence[int] = None,
+        y_prior=None,
+        use_labels_groups: bool = False,
+        classifier_parameters: Optional[dict] = None,
         encode_covariates: Tunable[bool] = False,
         deeply_inject_covariates: Tunable[bool] = True,
         use_batch_norm: Tunable[Literal["encoder", "decoder", "none", "both"]] = "both",
@@ -125,9 +137,61 @@ class VAE(BaseMinifiedModeModuleClass):
         self.n_labels = n_labels
         self.latent_distribution = latent_distribution
         self.encode_covariates = encode_covariates
-
+        
         self.use_size_factor_key = use_size_factor_key
         self.use_observed_lib_size = use_size_factor_key or use_observed_lib_size
+
+        #parameters added to add the classifier : 
+        classifier_parameters = classifier_parameters or {}
+        self.n_labels = n_labels
+        # Classifier takes n_latent as input
+        cls_parameters = {
+            "n_layers": n_layers,
+            "n_hidden": n_hidden,
+            "dropout_rate": dropout_rate,
+        }
+        cls_parameters.update(classifier_parameters)
+        self.classifier = Classifier(
+            n_latent,
+            n_labels=n_labels,
+            use_batch_norm=use_batch_norm_encoder,
+            use_layer_norm=use_layer_norm_encoder,
+            **cls_parameters,
+        )
+        self.y_prior = torch.nn.Parameter(
+            y_prior
+            if y_prior is not None
+            else (1 / n_labels) * torch.ones(1, n_labels),
+            requires_grad=False,
+        )
+        self.use_labels_groups = use_labels_groups
+        self.labels_groups = (
+            np.array(labels_groups) if labels_groups is not None else None
+        )
+        if self.use_labels_groups:
+            if labels_groups is None:
+                raise ValueError("Specify label groups")
+            unique_groups = np.unique(self.labels_groups)
+            self.n_groups = len(unique_groups)
+            if not (unique_groups == np.arange(self.n_groups)).all():
+                raise ValueError()
+            self.classifier_groups = Classifier(
+                n_latent, n_hidden, self.n_groups, n_layers, dropout_rate
+            )
+            self.groups_index = torch.nn.ParameterList(
+                [
+                    torch.nn.Parameter(
+                        torch.tensor(
+                            (self.labels_groups == i).astype(np.uint8),
+                            dtype=torch.uint8,
+                        ),
+                        requires_grad=False,
+                    )
+                    for i in range(self.n_groups)
+                ]
+            )
+
+
         if not self.use_observed_lib_size:
             if library_log_means is None or library_log_vars is None:
                 raise ValueError(
@@ -209,6 +273,63 @@ class VAE(BaseMinifiedModeModuleClass):
             scale_activation="softplus" if use_size_factor_key else "softmax",
         )
 
+    #classify method copied from scANVI to add a classifier to scVI (copied from _scanvae.py)
+    @auto_move_data
+    def classify(self, x, batch_index=None, cont_covs=None, cat_covs=None):
+        """Classify cells into cell types."""
+        if self.log_variational:
+            x = torch.log(1 + x)
+
+        if cont_covs is not None and self.encode_covariates:
+            encoder_input = torch.cat((x, cont_covs), dim=-1)
+        else:
+            encoder_input = x
+        if cat_covs is not None and self.encode_covariates:
+            categorical_input = torch.split(cat_covs, 1, dim=1)
+        else:
+            categorical_input = ()
+
+        qz, z = self.z_encoder(encoder_input, batch_index, *categorical_input)
+        # We classify using the inferred mean parameter of z_1 in the latent space
+        z = qz.loc
+        if self.use_labels_groups:
+            w_g = self.classifier_groups(z)
+            unw_y = self.classifier(z)
+            w_y = torch.zeros_like(unw_y)
+            for i, group_index in enumerate(self.groups_index):
+                unw_y_g = unw_y[:, group_index]
+                w_y[:, group_index] = unw_y_g / (
+                    unw_y_g.sum(dim=-1, keepdim=True) + 1e-8
+                )
+                w_y[:, group_index] *= w_g[:, [i]]
+        else:
+            w_y = self.classifier(z)
+        return w_y
+
+    #classification loss added to improve the latent space (copied from _scanvae.py)
+    
+    @auto_move_data
+    def classification_loss(self, labelled_dataset):
+        x = labelled_dataset[REGISTRY_KEYS.X_KEY]
+        y = labelled_dataset[REGISTRY_KEYS.LABELS_KEY]
+        batch_idx = labelled_dataset[REGISTRY_KEYS.BATCH_KEY]
+        cont_key = REGISTRY_KEYS.CONT_COVS_KEY
+        cont_covs = (
+            labelled_dataset[cont_key] if cont_key in labelled_dataset.keys() else None
+        )
+
+        cat_key = REGISTRY_KEYS.CAT_COVS_KEY
+        cat_covs = (
+            labelled_dataset[cat_key] if cat_key in labelled_dataset.keys() else None
+        )
+        classification_loss = F.cross_entropy(
+            self.classify(
+                x, batch_index=batch_idx, cat_covs=cat_covs, cont_covs=cont_covs
+            ),
+            y.view(-1).long(),
+        )
+        return classification_loss
+    
     def _get_inference_input(
         self,
         tensors,
@@ -434,19 +555,43 @@ class VAE(BaseMinifiedModeModuleClass):
             "pl": pl,
             "pz": pz,
         }
-
+    #modification of the loss function to take into account the classification loss 
     def loss(
         self,
         tensors,
         inference_outputs,
         generative_outputs,
         kl_weight: float = 1.0,
+        feed_labels=False,
+        labelled_tensors=None,
+        classification_ratio=None,
     ):
         """Computes the loss function for the model."""
+        qz1 = inference_outputs["qz"] 
+        z1 = inference_outputs["z"]
+        #qz2, z2 = self.encoder_z2_z1(z1s, ys) ? should we put z
+        
+
+         #assess if the batch is labelled  
+        if feed_labels:
+            y = tensors[REGISTRY_KEYS.LABELS_KEY]
+        else:
+            y = None
+        is_labelled = False if y is None else True
+    
+        ys, z1s = broadcast_labels(y, z1, n_broadcast=self.n_labels)
+        
+        #doubt : could we get them from generative_outputs ? 
+        pz1_m, pz1_v = self.decoder(z1, ys)
+    
+        loss_z1_unweight = -Normal(pz1_m, torch.sqrt(pz1_v)).log_prob(z1s).sum(dim=-1)
+        loss_z1_weight = qz1.log_prob(z1).sum(dim=-1)
+
         x = tensors[REGISTRY_KEYS.X_KEY]
         kl_divergence_z = kl(inference_outputs["qz"], generative_outputs["pz"]).sum(
             dim=1
         )
+
         if not self.use_observed_lib_size:
             kl_divergence_l = kl(
                 inference_outputs["ql"],
@@ -468,9 +613,59 @@ class VAE(BaseMinifiedModeModuleClass):
             "kl_divergence_l": kl_divergence_l,
             "kl_divergence_z": kl_divergence_z,
         }
-        return LossOutput(
-            loss=loss, reconstruction_loss=reconst_loss, kl_local=kl_local
+    
+        if is_labelled:
+        
+            if labelled_tensors is not None:
+                classifier_loss = self.classification_loss(labelled_tensors)
+                loss += classifier_loss * classification_ratio
+                return LossOutput(
+                    loss=loss,
+                    reconstruction_loss=reconst_loss,
+                    kl_local=kl_local,
+                    extra_metrics={
+                        "classification_loss": classifier_loss,
+                        "n_labelled_tensors": labelled_tensors[
+                            REGISTRY_KEYS.X_KEY
+                        ].shape[0],
+                    },
+                )
+            return LossOutput(
+                loss=loss,
+                reconstruction_loss=reconst_loss,
+                kl_local=kl_local,
+            )
+
+        probs = self.classifier(z1)
+        reconst_loss += loss_z1_weight + (
+            (loss_z1_unweight).view(self.n_labels, -1).t() * probs
+        ).sum(dim=1)
+
+        kl_divergence = (kl_divergence_z.view(self.n_labels, -1).t() * probs).sum(
+            dim=1
         )
+        kl_divergence += kl(
+            Categorical(probs=probs),
+            Categorical(probs=self.y_prior.repeat(probs.size(0), 1)),
+        )
+        kl_divergence += kl_divergence_l
+
+        loss = torch.mean(reconst_loss + kl_divergence * kl_weight)
+
+        if labelled_tensors is not None:
+            classifier_loss = self.classification_loss(labelled_tensors)
+            loss += classifier_loss * classification_ratio
+            return LossOutput(
+                loss=loss,
+                reconstruction_loss=reconst_loss,
+                kl_local=kl_divergence,
+                extra_metrics={"classification_loss": classifier_loss},
+            )
+        return LossOutput(
+            loss=loss, reconstruction_loss=reconst_loss, kl_local=kl_divergence
+        )
+
+    
 
     @torch.inference_mode()
     def sample(

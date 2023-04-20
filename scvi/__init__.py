@@ -20,6 +20,7 @@ test_var = "test"
 # Jax sets the root logger, this prevents double output.
 scvi_logger = logging.getLogger("scvi")
 scvi_logger.propagate = False
+print("version : scvi with classifier")
 
 __all__ = [
     "settings",

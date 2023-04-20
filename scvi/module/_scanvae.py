@@ -275,6 +275,7 @@ class SCANVAE(VAE):
         mean = torch.zeros_like(qz2.loc)
         scale = torch.ones_like(qz2.scale)
 
+        #remplacée par kl_divergence_z
         kl_divergence_z2 = kl(qz2, Normal(mean, scale)).sum(dim=1)
         loss_z1_unweight = -Normal(pz1_m, torch.sqrt(pz1_v)).log_prob(z1s).sum(dim=-1)
         loss_z1_weight = qz1.log_prob(z1).sum(dim=-1)
@@ -292,7 +293,7 @@ class SCANVAE(VAE):
         else:
             kl_divergence_l = 0.0
 
-        if is_labelled:
+        if is_labelled: #if the batch is labeled 
             loss = reconst_loss + loss_z1_weight + loss_z1_unweight
             kl_locals = {
                 "kl_divergence_z2": kl_divergence_z2,
@@ -317,7 +318,7 @@ class SCANVAE(VAE):
                 reconstruction_loss=reconst_loss,
                 kl_local=kl_locals,
             )
-
+        
         probs = self.classifier(z1)
         reconst_loss += loss_z1_weight + (
             (loss_z1_unweight).view(self.n_labels, -1).t() * probs
