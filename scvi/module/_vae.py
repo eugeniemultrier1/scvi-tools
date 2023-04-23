@@ -14,7 +14,7 @@ from scvi.autotune._types import Tunable
 from scvi.data._constants import ADATA_MINIFY_TYPE
 from scvi.distributions import NegativeBinomial, Poisson, ZeroInflatedNegativeBinomial
 from scvi.module.base import BaseMinifiedModeModuleClass, LossOutput, auto_move_data
-from scvi.nn import DecoderSCVI, Encoder, LinearDecoderSCVI, one_hot
+from scvi.nn import DecoderSCVI, Encoder, LinearDecoderSCVI, Decoder, one_hot
 
 torch.backends.cudnn.benchmark = True
 
@@ -151,6 +151,12 @@ class VAE(BaseMinifiedModeModuleClass):
             "dropout_rate": dropout_rate,
         }
         cls_parameters.update(classifier_parameters)
+
+        use_batch_norm_encoder = use_batch_norm == "encoder" or use_batch_norm == "both"
+        use_batch_norm_decoder = use_batch_norm == "decoder" or use_batch_norm == "both"
+        use_layer_norm_encoder = use_layer_norm == "encoder" or use_layer_norm == "both"
+        use_layer_norm_decoder = use_layer_norm == "decoder" or use_layer_norm == "both"
+
         self.classifier = Classifier(
             n_latent,
             n_labels=n_labels,
@@ -191,7 +197,6 @@ class VAE(BaseMinifiedModeModuleClass):
                 ]
             )
 
-
         if not self.use_observed_lib_size:
             if library_log_means is None or library_log_vars is None:
                 raise ValueError(
@@ -221,10 +226,6 @@ class VAE(BaseMinifiedModeModuleClass):
                 "{}.format(self.dispersion)"
             )
 
-        use_batch_norm_encoder = use_batch_norm == "encoder" or use_batch_norm == "both"
-        use_batch_norm_decoder = use_batch_norm == "decoder" or use_batch_norm == "both"
-        use_layer_norm_encoder = use_layer_norm == "encoder" or use_layer_norm == "both"
-        use_layer_norm_decoder = use_layer_norm == "decoder" or use_layer_norm == "both"
 
         # z encoder goes from the n_input-dimensional data to an n_latent-d
         # latent space representation
@@ -562,31 +563,20 @@ class VAE(BaseMinifiedModeModuleClass):
         inference_outputs,
         generative_outputs,
         kl_weight: float = 1.0,
-        feed_labels=False,
+        feed_labels=True,
         labelled_tensors=None,
         classification_ratio=None,
     ):
         """Computes the loss function for the model."""
         qz1 = inference_outputs["qz"] 
         z1 = inference_outputs["z"]
-        #qz2, z2 = self.encoder_z2_z1(z1s, ys) ? should we put z
-        
 
-         #assess if the batch is labelled  
         if feed_labels:
             y = tensors[REGISTRY_KEYS.LABELS_KEY]
         else:
             y = None
-        is_labelled = False if y is None else True
-    
-        ys, z1s = broadcast_labels(y, z1, n_broadcast=self.n_labels)
-        
-        #doubt : could we get them from generative_outputs ? 
-        pz1_m, pz1_v = self.decoder(z1, ys)
-    
-        loss_z1_unweight = -Normal(pz1_m, torch.sqrt(pz1_v)).log_prob(z1s).sum(dim=-1)
-        loss_z1_weight = qz1.log_prob(z1).sum(dim=-1)
 
+    
         x = tensors[REGISTRY_KEYS.X_KEY]
         kl_divergence_z = kl(inference_outputs["qz"], generative_outputs["pz"]).sum(
             dim=1
@@ -613,58 +603,27 @@ class VAE(BaseMinifiedModeModuleClass):
             "kl_divergence_l": kl_divergence_l,
             "kl_divergence_z": kl_divergence_z,
         }
-    
-        if is_labelled:
-        
-            if labelled_tensors is not None:
-                classifier_loss = self.classification_loss(labelled_tensors)
-                loss += classifier_loss * classification_ratio
-                return LossOutput(
-                    loss=loss,
-                    reconstruction_loss=reconst_loss,
-                    kl_local=kl_local,
-                    extra_metrics={
-                        "classification_loss": classifier_loss,
-                        "n_labelled_tensors": labelled_tensors[
-                            REGISTRY_KEYS.X_KEY
-                        ].shape[0],
-                    },
-                )
-            return LossOutput(
-                loss=loss,
-                reconstruction_loss=reconst_loss,
-                kl_local=kl_local,
-            )
-
-        probs = self.classifier(z1)
-        reconst_loss += loss_z1_weight + (
-            (loss_z1_unweight).view(self.n_labels, -1).t() * probs
-        ).sum(dim=1)
-
-        kl_divergence = (kl_divergence_z.view(self.n_labels, -1).t() * probs).sum(
-            dim=1
-        )
-        kl_divergence += kl(
-            Categorical(probs=probs),
-            Categorical(probs=self.y_prior.repeat(probs.size(0), 1)),
-        )
-        kl_divergence += kl_divergence_l
-
-        loss = torch.mean(reconst_loss + kl_divergence * kl_weight)
 
         if labelled_tensors is not None:
             classifier_loss = self.classification_loss(labelled_tensors)
             loss += classifier_loss * classification_ratio
             return LossOutput(
-                loss=loss,
-                reconstruction_loss=reconst_loss,
-                kl_local=kl_divergence,
-                extra_metrics={"classification_loss": classifier_loss},
-            )
+                            loss=loss,
+                            reconstruction_loss=reconst_loss,
+                            kl_local=kl_local,
+                            extra_metrics={
+                                "classification_loss": classifier_loss,
+                                "n_labelled_tensors": labelled_tensors[
+                                    REGISTRY_KEYS.X_KEY
+                                ].shape[0],
+                            },
+                        )
         return LossOutput(
-            loss=loss, reconstruction_loss=reconst_loss, kl_local=kl_divergence
-        )
-
+                        loss=loss,
+                        reconstruction_loss=reconst_loss,
+                        kl_local=kl_local,
+            )
+    
     
 
     @torch.inference_mode()

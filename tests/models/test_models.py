@@ -1617,3 +1617,11 @@ def test_early_stopping():
     model = SCVI(adata)
     model.train(n_epochs, early_stopping=True, plan_kwargs={"lr": 0})
     assert len(model.history["elbo_train"]) < n_epochs
+
+def test_scvi_classifier() : 
+    adata = synthetic_iid()
+    SCVI.setup_anndata(adata, "labels", "label_0", batch_key="batch")
+    model = SCVI(adata)
+    model.train(max_epochs=1, train_size=0.5)
+    logged_keys = model.history.keys()
+    assert "classification_loss_validation" in logged_keys
