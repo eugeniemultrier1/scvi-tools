@@ -157,6 +157,7 @@ class TrainingPlan(TunableMixin, pl.LightningModule):
         lr_min: Tunable[float] = 0,
         max_kl_weight: Tunable[float] = 1.0,
         min_kl_weight: Tunable[float] = 0.0,
+        classification_ratio: int = 50,
         **loss_kwargs,
     ):
         super().__init__()
@@ -190,7 +191,7 @@ class TrainingPlan(TunableMixin, pl.LightningModule):
         self._loss_args = set(signature(self.module.loss).parameters.keys())
         if "kl_weight" in self._loss_args:
             self.loss_kwargs.update({"kl_weight": self.kl_weight})
-
+        self.loss_kwargs.update({"classification_ratio": classification_ratio})
         self.initialize_train_metrics()
         self.initialize_val_metrics()
 
@@ -338,7 +339,20 @@ class TrainingPlan(TunableMixin, pl.LightningModule):
             kl_weight = self.kl_weight
             self.loss_kwargs.update({"kl_weight": kl_weight})
             self.log("kl_weight", kl_weight, on_step=True, on_epoch=False)
-        _, _, scvi_loss = self.forward(batch, loss_kwargs=self.loss_kwargs)
+        if len(batch) == 2:
+            full_dataset = batch[0]
+            labelled_dataset = batch[1]
+        else:
+            #version for fully annotated datasets only 
+            full_dataset = batch
+            labelled_dataset = batch
+        input_kwargs = {
+            "feed_labels": False,
+            "labelled_tensors": labelled_dataset,
+        }
+        self.loss_kwargs.update(input_kwargs)
+        
+        _, _, scvi_loss = self.forward(full_dataset, loss_kwargs=self.loss_kwargs)
         self.log("train_loss", scvi_loss.loss, on_epoch=True)
         self.compute_and_log_metrics(scvi_loss, self.train_metrics, "train")
         return scvi_loss.loss
@@ -726,6 +740,7 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
             "feed_labels": False,
             "labelled_tensors": labelled_dataset,
         }
+        #i do not undertand this next line 
         input_kwargs.update(self.loss_kwargs)
         _, _, loss_output = self.forward(full_dataset, loss_kwargs=input_kwargs)
         loss = loss_output.loss
